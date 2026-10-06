@@ -215,6 +215,36 @@ func TestCaptureWriterStopsBufferingOverCap(t *testing.T) {
 	}
 }
 
+func TestReadFromTransitionsToPassthroughOverCap(t *testing.T) {
+	// Intersection of the two paths: ReadFrom starts capturing, trips the
+	// cap mid-stream, and must transition to pure passthrough — exact byte
+	// count, empty buffer, full delivery. This is where a hand-rolled loop
+	// hides off-by-ones (>= vs >, short-final-chunk accounting), so the
+	// total is deliberately uneven against the 32 KiB copy chunks.
+	const total = maxCaptureBytes + 500*1024 + 123
+	// noWriterTo hides strings.Reader.WriteTo: without it io.Copy would call
+	// src.WriteTo(dst) and never exercise ReadFrom at all.
+	type noWriterTo struct{ io.Reader }
+	rec := httptest.NewRecorder()
+	cw := newCaptureWriter(rec)
+	n, err := io.Copy(cw, noWriterTo{strings.NewReader(strings.Repeat("z", total))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != total {
+		t.Fatalf("ReadFrom returned %d, want %d (short final chunk lost?)", n, total)
+	}
+	if got := rec.Body.Len(); got != total {
+		t.Fatalf("client received %d bytes, want %d", got, total)
+	}
+	if !cw.truncated {
+		t.Fatal("truncated = false, want true after cap tripped mid-copy")
+	}
+	if got := cw.body.Len(); got != 0 {
+		t.Fatalf("buffer len = %d, want 0 (drop-entire on transition)", got)
+	}
+}
+
 func TestReadFromStreamsAndCaptures(t *testing.T) {
 	// Handlers serving downloads via io.Copy must keep working through the
 	// wrapper: small bodies are captured and replayed, proving ReadFrom

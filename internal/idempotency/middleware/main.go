@@ -95,11 +95,15 @@ func (c *captureWriter) Write(b []byte) (int, error) {
 	}
 	if !c.truncated {
 		if c.body.Len()+len(b) > maxCaptureBytes {
-			// Over the cap: the buffer is Reset AND truncated is set, so all
-			// later Writes skip buffering entirely — memory stays flat no
-			// matter how large the response gets. Merely skipping the store
-			// while letting the buffer grow would keep the very memory
-			// pressure the cap exists to prevent. Streaming continues below.
+			// Over the cap: Reset drops the ENTIRE buffer, not just the tail
+			// past the cap, and truncated freezes buffering for all later
+			// Writes — memory stays flat no matter how large the response
+			// gets. Deliberate choice: a 1.01 MiB and a 100 MiB response
+			// behave identically (nothing stored), trading "partial body
+			// for debugging" for simple semantics. Merely skipping the
+			// store while letting the buffer grow would keep the very
+			// memory pressure the cap exists to prevent.
+			// Streaming continues below, untouched.
 			c.truncated = true
 			c.body.Reset()
 		} else {
@@ -145,6 +149,9 @@ func (c *captureWriter) ReadFrom(r io.Reader) (int64, error) {
 		c.WriteHeader(http.StatusOK) // Implicit 200, exactly like net/http.
 	}
 	if c.truncated {
+		// Delegate to the UNDERLYING writer, never to ourselves: calling
+		// io.Copy(c, r) here would re-enter ReadFrom and recurse until the
+		// stack overflows. Future "simplifications" must preserve this.
 		return io.Copy(c.ResponseWriter, r)
 	}
 	var total int64
@@ -216,10 +223,13 @@ func (s *store) Middleware(next http.Handler) http.Handler {
 		//   3xx: not stored either. Redirects are safe to replay in theory,
 		//     but clients that followed the redirect don't retry the
 		//     original, so storing buys nothing; the chain simply re-runs.
-		//   409: not stored. A business-rule 409 re-evaluated on retry is
-		//     correct; an "already processing" 409 would also be fine to
-		//     replay as backoff signal — but re-running the check is
-		//     equally correct and simpler to reason about.
+		//   409: not stored. This algorithm has NO in-flight state — the map
+		//     holds only completed responses — so a handler-returned 409 is
+		//     always a business conflict and re-execution is correct. INVARIANT:
+		//     if in-flight marking is ever added (row exists, response not
+		//     yet written), this branch must change: re-executing on 409
+		//     would double-run a still-processing operation; return the
+		//     stored/outstanding 409 as backoff signal instead.
 		//   Over-cap 2xx: not stored (see maxCaptureBytes). The retry then
 		//     RE-EXECUTES the handler, side effects included — the dangerous
 		//     option, chosen here for simplicity. Production alternatives:
