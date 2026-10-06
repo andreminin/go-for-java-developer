@@ -1,0 +1,58 @@
+name: ci
+
+# Three test categories, matching the repo's testing contract:
+#  - unit: stdlib-only, always runs (go build, vet, gofmt, go test -race).
+#  - integration: live PostgreSQL via a service container, build-tagged so
+#    contributors without Docker still get a green `go test ./...`.
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: gofmt
+        run: "test -z \"$(gofmt -l .)\" || (echo 'run: gofmt -w .' && gofmt -l . && exit 1)"
+      - name: vet (default tags)
+        run: go vet ./...
+      - name: vet (integration tag)
+        run: go vet -tags=integration ./...
+      - name: build
+        run: go build ./...
+      - name: test with race detector
+        run: go test -race ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://app:app@localhost:5432/app?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: install psql client
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends postgresql-client
+      - name: apply migrations
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f testdata/migrations/001_init.sql
+      - name: integration tests with race detector
+        run: go test -tags=integration -race ./internal/postgres/integration/

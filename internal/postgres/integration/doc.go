@@ -13,6 +13,11 @@
 //
 // NOTE: this package imports github.com/lib/pq, a database/sql driver used
 // ONLY by the build-tagged integration tests. The runnable examples stay
-// standard-library-only. If you run `go mod tidy`, include the tag or the
+// standard-library-only. Why lib/pq and not pgx: the tests deliberately
+// exercise the standard database/sql interface the examples teach (JDBC-like
+// and driver-agnostic); production Go services overwhelmingly use pgx for its
+// typed API, prepared-statement caching, COPY support, and pooling — see the
+// "Production note" in internal/postgres/README.md.
+// If you run `go mod tidy`, include the tag or the
 // driver is dropped from go.mod: `go mod tidy -tags=integration`.
 package integration

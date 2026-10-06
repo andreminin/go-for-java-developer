@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -188,5 +189,54 @@ func TestLargeBodyStreamsButIsNotStored(t *testing.T) {
 	}
 	if executions != 2 {
 		t.Fatalf("executions = %d, want 2 (no stored replay)", executions)
+	}
+}
+
+func TestCaptureWriterStopsBufferingOverCap(t *testing.T) {
+	// Direct unit test of the memory guarantee: once the cap trips, the
+	// buffer is dropped and stays empty no matter how much more streams
+	// through — the client still receives every byte.
+	rec := httptest.NewRecorder()
+	cw := newCaptureWriter(rec)
+	chunk := bytes.Repeat([]byte("y"), 256*1024) // 256 KiB x6 = 1.5 MiB
+	for i := 0; i < 6; i++ {
+		if _, err := cw.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !cw.truncated {
+		t.Fatal("truncated = false, want true after exceeding cap")
+	}
+	if got := cw.body.Len(); got != 0 {
+		t.Fatalf("buffer len = %d, want 0 (flat memory above cap)", got)
+	}
+	if got, want := rec.Body.Len(), 6*len(chunk); got != want {
+		t.Fatalf("client received %d bytes, want %d", got, want)
+	}
+}
+
+func TestReadFromStreamsAndCaptures(t *testing.T) {
+	// Handlers serving downloads via io.Copy must keep working through the
+	// wrapper: small bodies are captured and replayed, proving ReadFrom
+	// tees instead of bypassing the buffer.
+	executions := 0
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		executions++
+		_, _ = io.Copy(w, strings.NewReader("hello-copy"))
+	})
+	s := newStore()
+	srv := httptest.NewServer(s.Middleware(handler))
+	defer srv.Close()
+
+	_, body1, _ := doPost(t, srv.URL, "kcopy", "pay")
+	_, body2, replayed := doPost(t, srv.URL, "kcopy", "pay")
+	if body1 != "hello-copy" || body2 != "hello-copy" {
+		t.Fatalf("bodies = %q, %q, want hello-copy twice", body1, body2)
+	}
+	if replayed != "true" {
+		t.Fatal("small io.Copy body should be captured and replayed")
+	}
+	if executions != 1 {
+		t.Fatalf("executions = %d, want 1", executions)
 	}
 }

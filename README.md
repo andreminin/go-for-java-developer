@@ -175,10 +175,13 @@ This project follows the [golang-standards/project-layout](https://github.com/go
    must be meaningful under `-race`.
 4. Follow the comment golden rule: explain **why**, not **what**.
 5. Run before pushing:
-   `gofmt -l .`, `go vet ./...`, `go test -race ./...`.
+   `gofmt -l .`, `go vet ./...`, `go test -race ./...`
+   (shortcuts: `make fmt vet test-race`; full list: `make help`).
+   Live-DB checks: `make db-up db-migrate test-integration`.`.
 6. Never commit IDE-specific files (`.idea/`, `.vscode/`, `*.iml`) — they are
    already in `.gitignore`; keep them out of PRs.
-7. If your commit message claims live verification (e.g. "verified against
-   PostgreSQL via compose"), say exactly what you ran: container image,
-   migration file, and the queries or test command with their observed output.
-   Verified documentation beats documentation.`.
+7. If your commit changes any runnable command (README snippet, Makefile target,
+   migration step), the commit message must state the verification environment:
+   OS, tool versions (`go version`, `docker --version`, image tag), and the
+   observed result (exit code or key output lines). Verified documentation beats
+   documentation — and the claim must be re-checkable from the message alone.`.

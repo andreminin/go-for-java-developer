@@ -95,8 +95,11 @@ func (c *captureWriter) Write(b []byte) (int, error) {
 	}
 	if !c.truncated {
 		if c.body.Len()+len(b) > maxCaptureBytes {
-			// Over the cap: stop buffering (and drop what we kept — it will
-			// never be stored) but keep streaming to the client untouched.
+			// Over the cap: the buffer is Reset AND truncated is set, so all
+			// later Writes skip buffering entirely — memory stays flat no
+			// matter how large the response gets. Merely skipping the store
+			// while letting the buffer grow would keep the very memory
+			// pressure the cap exists to prevent. Streaming continues below.
 			c.truncated = true
 			c.body.Reset()
 		} else {
@@ -107,17 +110,59 @@ func (c *captureWriter) Write(b []byte) (int, error) {
 }
 
 // Flush preserves streaming for handlers that assert http.Flusher (SSE,
-// long-poll). It forwards only if the underlying writer supports it; the
-// captureWriter itself always satisfies the interface so handlers never see
-// a "feature unavailable" fallback just because the middleware is present.
+// long-poll). It forwards only if the underlying writer supports it.
 //
-// Deliberately NOT implemented: http.Hijacker. A hijacked connection (raw
-// TCP take-over for websockets) bypasses Write/WriteHeader entirely, so
-// there is nothing to capture — such requests simply pass through
-// unrecorded and a retry re-executes, which is the safe default.
+// Fidelity tradeoff, documented not fixed: because Flush is always defined,
+// the wrapper always satisfies http.Flusher — even if the underlying writer
+// does not. A handler taking the `ok == true` branch therefore cannot tell
+// the two cases apart. In practice net/http writers always flush, so the lie
+// never fires; strict fidelity would need a factory returning different
+// concrete types per underlying interface set, which is overkill here.
+//
+// Deliberately NOT implemented: http.Hijacker and http.Pusher. A hijacked
+// connection (raw TCP take-over for websockets) bypasses Write/WriteHeader
+// entirely, so there is nothing to capture — such requests pass through
+// unrecorded and a retry re-executes. WARNING: that is only safe for
+// handlers that check the assertion with `, ok` and fall back gracefully.
+// Hand-rolled upgraders doing the unchecked form `w.(http.Hijacker)` will
+// PANIC through this wrapper — skip the idempotency middleware entirely for
+// WebSocket endpoints. Same category: Pusher (HTTP/2 server push, rarely
+// used) is hidden behind the wrapper even when the server supports it.
 func (c *captureWriter) Flush() {
 	if f, ok := c.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// ReadFrom preserves io.Copy fast paths. Without it, io.Copy(dst, src)
+// cannot use sendfile/splice through the wrapper and every large download
+// falls back to a userspace buffer copy — a small but real production
+// regression. When still capturing, chunks flow through Write (cap enforced
+// there); once truncated, the copy delegates straight to the underlying
+// writer so the fast path (src WriterTo / dst ReaderFrom) applies again.
+func (c *captureWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !c.wroteHeader {
+		c.WriteHeader(http.StatusOK) // Implicit 200, exactly like net/http.
+	}
+	if c.truncated {
+		return io.Copy(c.ResponseWriter, r)
+	}
+	var total int64
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			if _, werr := c.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
 	}
 }
 
@@ -161,11 +206,26 @@ func (s *store) Middleware(next http.Handler) http.Handler {
 		cw := newCaptureWriter(w)
 		next.ServeHTTP(cw, r)
 
-		// Store for replay ONLY on success within the cap.
-		// Why not 5xx: replaying a stored 500 would mask a transient failure
-		// that a retry might survive — errors must stay retryable, so the
-		// next attempt re-executes the handler.
-		// Why not over-cap bodies: see maxCaptureBytes.
+		// Store for replay ONLY on 2xx within the cap. The boundary choices:
+		//   5xx: NEVER store. Replaying a stored 500 would mask a transient
+		//     failure that a retry might survive — errors must stay
+		//     retryable, so the next attempt re-executes the handler. This
+		//     is the single most important correctness point here.
+		//   429: never store, same reasoning — the retry must re-execute
+		//     once the rate-limit window passes.
+		//   3xx: not stored either. Redirects are safe to replay in theory,
+		//     but clients that followed the redirect don't retry the
+		//     original, so storing buys nothing; the chain simply re-runs.
+		//   409: not stored. A business-rule 409 re-evaluated on retry is
+		//     correct; an "already processing" 409 would also be fine to
+		//     replay as backoff signal — but re-running the check is
+		//     equally correct and simpler to reason about.
+		//   Over-cap 2xx: not stored (see maxCaptureBytes). The retry then
+		//     RE-EXECUTES the handler, side effects included — the dangerous
+		//     option, chosen here for simplicity. Production alternatives:
+		//     return 409 with "response too large to replay" (Stripe's
+		//     approach), or store a {"replayable": false} marker and let
+		//     the client decide. Whatever you pick, comment it.
 		if cw.status >= 200 && cw.status < 300 && !cw.truncated {
 			s.mu.Lock()
 			s.rows[key] = storedResp{code: cw.status, header: cw.header, body: cw.body.Bytes()}

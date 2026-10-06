@@ -135,6 +135,29 @@ ignores the files entirely. One maintenance note: the tests use the
 `github.com/lib/pq` driver, so keep it in `go.mod` with
 `go mod tidy -tags=integration` — a tag-less tidy would drop it.
 
+> **Callout: `jsonb` normalizes — compare semantically, not as text.**
+> These two inserts produce the *same* stored value, and the `SELECT` returns TRUE:
+> ```sql
+> INSERT INTO t (body) VALUES ('{"a": 1}');
+> INSERT INTO t (body) VALUES ('{"a":1}');
+> SELECT body = '{"a":  1}'::jsonb FROM t; -- TRUE
+> ```
+> `jsonb` parses to a binary form and discards insignificant whitespace (and key
+> order — plus duplicate keys, keeping the last). The integration test hit exactly
+> this: `{"ok":true}` came back as `{"ok": true}`. Comparing `body::text` against
+> a literal is a footgun; compare `jsonb = jsonb` instead. Preemptive warning for
+> what you will hit next: if a response body must round-trip byte-for-byte, use
+> `json` (preserves everything verbatim), not `jsonb`. For idempotency replay this
+> usually doesn't matter — clients parse JSON, they don't diff bytes.
+
+> **Production note: `database/sql` vs `pgx`.** This repo teaches the standard
+> `database/sql` interface (`TxOptions`, `BeginTx`) because it is stable,
+> driver-agnostic, and maps 1:1 to JDBC concepts. For production Go services the
+> industry default is `pgx` (native protocol, no `database/sql` overhead unless
+> you use `pgx/stdlib`): prepared-statement caching, typed scanning without
+> `*string`/`sql.Null*` ceremony, `COPY` support, and `LISTEN/NOTIFY`. Learn the
+> semantics here, reach for `pgx` at work.
+
 ## Common Mistakes and How to Avoid Them
 
 - **No retry on `40001`** — treating a serialization abort as a hard failure.

@@ -11,6 +11,11 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Profiling and fuzzing artifacts
+*.prof
+*.testlog
+fuzz/
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
@@ -35,3 +40,8 @@ go.work.sum
 *.iml
 *.swp
 *~
+
+# Local bind-mounted database data (compose uses a named volume by default,
+# but a future contributor switching to a bind mount must not commit pgdata/).
+pgdata/
+data/
