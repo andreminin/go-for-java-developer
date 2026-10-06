@@ -27,7 +27,11 @@ go.work.sum
 
 # env file
 .env
+.env.local
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Editor/IDE — never commit IDE-specific files (see README Contributing).
+.idea/
+.vscode/
+*.iml
+*.swp
+*~

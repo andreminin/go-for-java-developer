@@ -30,7 +30,7 @@ same effect as performing it once (`f(f(x)) == f(x)`).
 | Spring Retry / Resilience4j retry | Client resends same `Idempotency-Key` | Retry policy lives on the client; the server dedups — both sides needed |
 | `OncePerRequestFilter` / interceptor | `net/http` middleware (`func(http.Handler) http.Handler`) | Same shape: wrap chain, pre-check, post-save; no framework required |
 | JPA `@Id` on dedup entity + `save` catching constraint violation | `INSERT ... ON CONFLICT DO NOTHING` + affected-rows check | The atomic check must be ONE statement; read-then-write races |
-| `ResponseEntity` caching wrapper | `httptest.ResponseRecorder`-style capture | Capture status + body to persist for replay |
+| `ResponseEntity` caching wrapper | Streaming tee `ResponseWriter` (embeds + buffers) | Capture status + headers + body for replay without breaking `Flusher`/SSE; store 2xx under cap only |
 | Manual `ConcurrentHashMap` dedup | Same in-memory map for demos only | Process-local dedup dies with the instance — PostgreSQL table is the real store |
 
 ## Code Examples
@@ -69,16 +69,24 @@ but unreplayable); no retention cleanup (unbounded table growth).
 
 ```go
 // Missing key on POST => 400 (fail fast beats silent duplicates).
-// Known key => replay stored {code, body} with Idempotent-Replayed: true.
-// Unknown key => run handler, capture response, persist, return.
+// Known key => replay stored {code, headers, body} with Idempotent-Replayed: true.
+// Unknown key => run handler through a streaming tee-writer; store ONLY 2xx
+// responses under the 1 MiB capture cap.
 srv := httptest.NewServer(store.Middleware(handler))
 ```
 
 What happens: first POST executes (handler count 1); retry returns byte-identical
-response with `Idempotent-Replayed: true`; keyless POST gets 400.
-How it looks in Java: `OncePerRequestFilter` doing the same header check + JPA lookup.
-Pitfalls: applying middleware to safe methods (`GET` needs no keys); replaying without
-preserving the original status code; caching streaming/SSE responses.
+response with `Idempotent-Replayed: true`; keyless POST gets 400; a 500 is never
+stored, so its retry re-executes (errors stay retryable); a >1 MiB body streams
+to the client but is never stored.
+How it looks in Java: `OncePerRequestFilter` doing the same header check + JPA
+lookup, with an `HttpServletResponseWrapper` whose output stream tees bytes into
+a buffer — except the servlet API makes you subclass, while Go composes via
+interface embedding.
+Pitfalls: buffering the whole response with `httptest.NewRecorder` (breaks SSE /
+`http.Flusher` and doubles memory — the tee writer exists precisely to avoid
+this); replaying a stored 500 (masks transient failures); replaying without
+preserving the original status code and headers; caching unbounded bodies.
 
 ## Algorithm
 

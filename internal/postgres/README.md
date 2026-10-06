@@ -116,6 +116,25 @@ How it looks in Java: same SQL in a `@Transactional` webhook handler.
 Pitfalls: checking "seen" in a separate transaction from the effect (race window —
 keep them in ONE txn); unbounded inbox growth (add retention cleanup).
 
+## Live verification (integration tests)
+
+The `integration/` package asserts the quoted SQL against real PostgreSQL:
+`ON CONFLICT DO NOTHING` row counts, disjoint `SKIP LOCKED` claims under two
+competing transactions, and semantic JSONB replay comparison. Verified against
+`postgres:16-alpine` via `docker-compose.yml` (see the main README's Docker
+section for setup and the exact walkthrough queries):
+
+```bash
+docker compose up -d db   # + apply testdata/migrations/001_init.sql once
+go test -tags=integration -race ./internal/postgres/integration/
+```
+
+Without the `integration` tag (or without the container) the suite stays green:
+the tests Skip when the database is unreachable, and plain `go test ./...`
+ignores the files entirely. One maintenance note: the tests use the
+`github.com/lib/pq` driver, so keep it in `go.mod` with
+`go mod tidy -tags=integration` — a tag-less tidy would drop it.
+
 ## Common Mistakes and How to Avoid Them
 
 - **No retry on `40001`** — treating a serialization abort as a hard failure.

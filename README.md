@@ -22,7 +22,9 @@ Supporting materials:
 
 ## Requirements
 
-- Go 1.21+ (tested with `go version`; examples use only the standard library)
+- Go 1.21+ (tested with `go version`; runnable examples use only the standard
+  library — the single external module, `github.com/lib/pq`, is used solely by
+  the build-tagged integration tests in `internal/postgres/integration/`)
 - PostgreSQL 14+ and Docker — optional, only for trying the DB-backed snippets live
   (see below); all `go run` demos and `go test` suites work without a database
 
@@ -174,3 +176,9 @@ This project follows the [golang-standards/project-layout](https://github.com/go
 4. Follow the comment golden rule: explain **why**, not **what**.
 5. Run before pushing:
    `gofmt -l .`, `go vet ./...`, `go test -race ./...`.
+6. Never commit IDE-specific files (`.idea/`, `.vscode/`, `*.iml`) — they are
+   already in `.gitignore`; keep them out of PRs.
+7. If your commit message claims live verification (e.g. "verified against
+   PostgreSQL via compose"), say exactly what you ran: container image,
+   migration file, and the queries or test command with their observed output.
+   Verified documentation beats documentation.`.

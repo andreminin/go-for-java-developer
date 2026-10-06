@@ -5,7 +5,8 @@
 //     either reject with 400 for unsafe methods or execute non-idempotently
 //     for safe ones — a policy decision, shown here as 400 on POST).
 //  2. Before the handler: check the dedup table (INSERT ... ON CONFLICT).
-//  3. After the handler: store status code + body for replay.
+//  3. After the handler: store status code + headers + body for replay —
+//     but ONLY for 2xx responses under the capture cap (see below).
 //  4. On redelivery: short-circuit with the stored response, handler never runs.
 //
 // In Java/Spring this is a OncePerRequestFilter / HandlerInterceptor with the
@@ -25,6 +26,16 @@ import (
 	"sync"
 )
 
+// maxCaptureBytes caps how much of a response body the middleware buffers
+// for replay. Above this, the response still streams to the client but is
+// NOT stored, so a retry re-executes instead of replaying.
+//
+// Why a cap at all: buffering an unbounded body (file download, export)
+// holds it in RAM and defeats the purpose of streaming. This is the same
+// tradeoff Stripe documents for its Idempotency-Key API: responses above
+// the replayable size are not replayed, and clients must handle that.
+const maxCaptureBytes = 1 << 20 // 1 MiB
+
 // store is a minimal dedup table for HTTP responses.
 type store struct {
 	mu   sync.Mutex
@@ -32,14 +43,86 @@ type store struct {
 }
 
 type storedResp struct {
-	code int
-	body []byte
+	code   int
+	header http.Header
+	body   []byte
 }
 
 func newStore() *store { return &store{rows: make(map[string]storedResp)} }
 
+// captureWriter implements http.ResponseWriter and wraps the real one.
+// It tees every Write into an in-memory buffer (for idempotency replay)
+// while passing the bytes through to the client immediately.
+//
+// In Java this is the equivalent of wrapping HttpServletResponse with a
+// caching wrapper that calls through to the underlying stream AND records
+// the bytes — except the servlet API makes you subclass, while Go composes
+// via interface embedding.
+//
+// Why not httptest.NewRecorder (a test utility): it buffers the ENTIRE
+// response before writing anything to the client, which breaks streaming
+// responses (SSE, large downloads, http.Flusher) and holds big bodies twice
+// in memory. The tee preserves first-byte latency and streaming semantics.
+type captureWriter struct {
+	http.ResponseWriter
+	status      int
+	header      http.Header // Snapshot point: cloned at WriteHeader time.
+	body        bytes.Buffer
+	wroteHeader bool
+	truncated   bool // Set once the body exceeds maxCaptureBytes.
+}
+
+func newCaptureWriter(w http.ResponseWriter) *captureWriter {
+	return &captureWriter{ResponseWriter: w, status: http.StatusOK}
+}
+
+func (c *captureWriter) WriteHeader(status int) {
+	if c.wroteHeader {
+		return // Mirror net/http: superfluous WriteHeader calls are ignored.
+	}
+	c.wroteHeader = true
+	c.status = status
+	// Why clone here: the handler may mutate its header map after returning,
+	// so snapshot at commit time (first WriteHeader/Write), like the server
+	// snapshotting headers onto the wire.
+	c.header = c.ResponseWriter.Header().Clone()
+	c.ResponseWriter.WriteHeader(status)
+}
+
+func (c *captureWriter) Write(b []byte) (int, error) {
+	if !c.wroteHeader {
+		c.WriteHeader(http.StatusOK) // Implicit 200, exactly like net/http.
+	}
+	if !c.truncated {
+		if c.body.Len()+len(b) > maxCaptureBytes {
+			// Over the cap: stop buffering (and drop what we kept — it will
+			// never be stored) but keep streaming to the client untouched.
+			c.truncated = true
+			c.body.Reset()
+		} else {
+			c.body.Write(b)
+		}
+	}
+	return c.ResponseWriter.Write(b)
+}
+
+// Flush preserves streaming for handlers that assert http.Flusher (SSE,
+// long-poll). It forwards only if the underlying writer supports it; the
+// captureWriter itself always satisfies the interface so handlers never see
+// a "feature unavailable" fallback just because the middleware is present.
+//
+// Deliberately NOT implemented: http.Hijacker. A hijacked connection (raw
+// TCP take-over for websockets) bypasses Write/WriteHeader entirely, so
+// there is nothing to capture — such requests simply pass through
+// unrecorded and a retry re-executes, which is the safe default.
+func (c *captureWriter) Flush() {
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Middleware enforces idempotency for POST requests carrying Idempotency-Key.
-// Key extraction -> pre-handler check -> save response -> replay on conflict.
+// Key extraction -> pre-handler check -> tee-capture -> conditional store.
 func (s *store) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -57,29 +140,37 @@ func (s *store) Middleware(next http.Handler) http.Handler {
 		if prev, ok := s.rows[key]; ok {
 			s.mu.Unlock()
 			// Replay: handler does NOT run again (exactly-once effect).
+			// Original headers are restored so the replay is byte-faithful.
+			for k, vv := range prev.header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
 			w.Header().Set("Idempotent-Replayed", "true")
 			w.WriteHeader(prev.code)
 			_, _ = w.Write(prev.body)
 			return
 		}
 		s.mu.Unlock()
+		// NOTE: two concurrent FIRST deliveries with the same key can both
+		// miss the map and both execute (check-then-act race). The in-memory
+		// map is demo-grade; the PostgreSQL version does not have this race
+		// because INSERT ... ON CONFLICT DO NOTHING is a single atomic
+		// statement (see internal/idempotency/dedup_table).
 
-		// Capture the handler's response so we can store it.
-		// In Java: wrap HttpServletResponse with a caching wrapper.
-		rec := httptest.NewRecorder()
-		next.ServeHTTP(rec, r)
+		cw := newCaptureWriter(w)
+		next.ServeHTTP(cw, r)
 
-		s.mu.Lock()
-		s.rows[key] = storedResp{code: rec.Code, body: rec.Body.Bytes()}
-		s.mu.Unlock()
-
-		for k, vv := range rec.Header() {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
+		// Store for replay ONLY on success within the cap.
+		// Why not 5xx: replaying a stored 500 would mask a transient failure
+		// that a retry might survive — errors must stay retryable, so the
+		// next attempt re-executes the handler.
+		// Why not over-cap bodies: see maxCaptureBytes.
+		if cw.status >= 200 && cw.status < 300 && !cw.truncated {
+			s.mu.Lock()
+			s.rows[key] = storedResp{code: cw.status, header: cw.header, body: cw.body.Bytes()}
+			s.mu.Unlock()
 		}
-		w.WriteHeader(rec.Code)
-		_, _ = w.Write(rec.Body.Bytes())
 	})
 }
 
@@ -96,9 +187,11 @@ func main() {
 	srv := httptest.NewServer(s.Middleware(handler))
 	defer srv.Close()
 
-	post := func(key, payload string) (int, string, string) {
-		req, _ := http.NewRequest(http.MethodPost, srv.URL, bytes.NewBufferString(payload))
-		req.Header.Set("Idempotency-Key", key)
+	post := func(url, key, payload string) (int, string, string) {
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewBufferString(payload))
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return 0, "", err.Error()
@@ -109,16 +202,28 @@ func main() {
 	}
 
 	fmt.Println("== 1. first POST executes handler ==")
-	code, body, replayed := post("key-1", `{"amount":100}`)
+	code, body, replayed := post(srv.URL, "key-1", `{"amount":100}`)
 	fmt.Printf("code=%d body=%s replayed=%q executions=%d\n", code, body, replayed, executions)
 
 	fmt.Println("== 2. retry with same key replays, handler skipped ==")
-	code, body, replayed = post("key-1", `{"amount":100}`)
+	code, body, replayed = post(srv.URL, "key-1", `{"amount":100}`)
 	fmt.Printf("code=%d body=%s replayed=%q executions=%d (still 1)\n", code, body, replayed, executions)
 
 	fmt.Println("== 3. POST without key is rejected ==")
-	req, _ := http.NewRequest(http.MethodPost, srv.URL, bytes.NewBufferString(`{}`))
-	resp, _ := http.DefaultClient.Do(req)
-	fmt.Printf("code=%d (expect 400)\n", resp.StatusCode)
-	resp.Body.Close()
+	code, _, _ = post(srv.URL, "", `{}`)
+	fmt.Printf("code=%d (expect 400)\n", code)
+
+	fmt.Println("== 4. 5xx is NOT replayed: retry re-executes ==")
+	failures := 0
+	failSrv := httptest.NewServer(newStore().Middleware(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			failures++
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}),
+	))
+	defer failSrv.Close()
+	code, _, _ = post(failSrv.URL, "key-9", `{}`)
+	code, _, replayed = post(failSrv.URL, "key-9", `{}`)
+	fmt.Printf("code=%d replayed=%q failures=%d (handler ran twice: errors stay retryable)\n",
+		code, replayed, failures)
 }
