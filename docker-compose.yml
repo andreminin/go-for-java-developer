@@ -1,0 +1,33 @@
+# Local PostgreSQL for running the DB-backed examples live.
+#
+# All Go tests run WITHOUT a database (the postgres-module examples use
+# in-memory simulations). This container is only for trying the real SQL
+# from Module 2 (isolation levels, SELECT ... FOR UPDATE, outbox, inbox)
+# against an actual PostgreSQL instance.
+#
+# Usage is documented in README.md ("Running the PostgreSQL examples live
+# with Docker"). Quick start:
+#   docker compose up -d db
+#   docker compose exec -T db psql -U app -d app -v ON_ERROR_STOP=1 \
+#     -f /testdata/migrations/001_init.sql
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: go-for-java-dev-db
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./testdata:/testdata:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
