@@ -11,14 +11,14 @@ All documentation, README files, and code comments are in English.
 | Module | Directory | What you learn |
 |--------|-----------|----------------|
 | 1. Concurrency and Parallelism | [internal/concurrency](internal/concurrency/README.md) | Goroutines, mutexes, atomics, channels, `select`, data races, deadlocks, Worker Pool, Fan-out/Fan-in, Pipeline, `errgroup` |
-| 2. PostgreSQL and Transactions | [internal/postgres](internal/postgres/README.md) | MVCC, isolation levels, `SELECT FOR UPDATE` / `SKIP LOCKED`, Transactional Outbox and Inbox |
+| 2. PostgreSQL and Transactions | [internal/postgres](internal/postgres/README.md) | MVCC, isolation levels, `SELECT FOR UPDATE` / `SKIP LOCKED`, Transactional Outbox and Inbox, Commitix-style intent leasing with a fencing token |
 | 3. Idempotency | [internal/idempotency](internal/idempotency/README.md) | Idempotency keys, deduplication table, HTTP middleware |
 
 Supporting materials:
 
 - [Java to Go cheat sheet](docs/java-to-go-cheatsheet.md)
 - [Glossary](docs/glossary.md)
-- [SQL migrations](testdata/migrations/001_init.sql)
+- [SQL migrations](testdata/migrations/) — `001_init.sql` (accounts, outbox, inbox, idempotency_keys) and `002_init.sql` (commitix_intents)
 
 ## Requirements
 
@@ -35,18 +35,22 @@ Supporting materials:
 go run ./internal/concurrency/mutex
 go run ./internal/concurrency/channels
 go run ./internal/postgres/outbox
+go run ./internal/postgres/commitix          # lease + fencing token demo
 
 # Run with the race detector (mandatory for concurrency code)
 go run -race ./internal/concurrency/goroutines
 go run -race ./internal/concurrency/patterns
 
 # Run all tests with the race detector
-go test ./... -race
+go test -race ./...
 
 # Run tests for a single module
 go test -race ./internal/concurrency/...
 go test -race ./internal/postgres/...
 go test -race ./internal/idempotency/...
+
+# Live-PostgreSQL tests (require Docker up + DATABASE_URL; see below)
+go test -race -count=1 -tags=integration ./internal/postgres/integration/...
 
 # Topic index
 go run ./cmd/demo
@@ -67,9 +71,13 @@ Prerequisites: [Docker](https://docs.docker.com/get-docker/) with the Compose pl
 # 1. Start PostgreSQL (first start pulls postgres:16-alpine)
 docker compose up -d db
 
-# 2. Apply the schema: accounts, outbox, inbox, idempotency_keys
+# 2. Apply the schema (equivalent to: make db-migrate):
+#    001_init.sql -> accounts, outbox, inbox, idempotency_keys
+#    002_init.sql -> commitix_intents
 docker compose exec -T db psql -U app -d app -v ON_ERROR_STOP=1 \
   -f /testdata/migrations/001_init.sql
+docker compose exec -T db psql -U app -d app -v ON_ERROR_STOP=1 \
+  -f /testdata/migrations/002_init.sql
 
 # 3. (Optional) point follow-up work at the database
 export DATABASE_URL=postgres://app:app@localhost:5432/app?sslmode=disable
@@ -144,6 +152,112 @@ INSERT INTO idempotency_keys (key, request_hash, response_code, response_body)
 VALUES ('key-abc', 'h1', 200, '{"ok":true}') ON CONFLICT DO NOTHING;
 ```
 
+### Try it: stale worker takeover with a fencing token
+
+From `internal/postgres/commitix` (the `commitix_intents` table). This is
+the one behavior a plain `SKIP LOCKED` queue cannot give you: a crashed
+worker's lease expires, the intent is released, a healthy worker takes
+over, and the stale worker's late write is rejected by the fence.
+
+The two fields that make it work are `lease_generation` (a fencing token
+that advances **only on ownership change**, never on recovery) and
+`attempt_count` (advances **only on claim**, so a flaky recovery loop
+cannot exhaust a retry budget).
+
+```sql
+-- setup: one READY intent
+INSERT INTO commitix_intents (payload) VALUES ('{"job":"charge-card"}')
+RETURNING id; -- id = 1
+
+-- worker-A claims it (simulating the CTE claim as a single UPDATE for
+-- readability; the real statement uses SELECT ... FOR UPDATE SKIP LOCKED
+-- in a CTE — see QClaim in the demo)
+UPDATE commitix_intents
+SET status           = 'RUNNING',
+    worker_id        = 'worker-A',
+    lease_until      = now() + interval '5 minutes',
+    lease_generation = lease_generation + 1,   -- 0 -> 1
+    attempt_count    = attempt_count + 1,      -- 0 -> 1
+    version          = version + 1
+WHERE id = 1;
+
+-- worker-A crashes mid-task. Simulate the crash by forcing the lease into
+-- the past (a real crash just stops heartbeating and time does this).
+UPDATE commitix_intents
+SET lease_until = now() - interval '1 second'
+WHERE id = 1;
+
+-- recovery sweep: release the expired lease.
+-- NOTE what is NOT in the SET list: lease_generation and attempt_count.
+-- Recovery is not an ownership change and is not a retry.
+UPDATE commitix_intents
+SET status      = 'READY',
+    worker_id   = NULL,
+    lease_until = NULL,
+    version     = version + 1
+WHERE status = 'RUNNING' AND lease_until < now();   -- UPDATE 1
+
+-- verify: generation and attempt_count unchanged
+SELECT status, lease_generation, attempt_count FROM commitix_intents WHERE id = 1;
+--  READY | 1 | 1
+
+-- worker-B takes over. This IS an ownership change: generation advances.
+UPDATE commitix_intents
+SET status           = 'RUNNING',
+    worker_id        = 'worker-B',
+    lease_until      = now() + interval '5 minutes',
+    lease_generation = lease_generation + 1,   -- 1 -> 2
+    attempt_count    = attempt_count + 1,      -- 1 -> 2
+    version          = version + 1
+WHERE id = 1;
+
+-- stale worker-A wakes up and tries to record SUCCESS with its old token.
+-- The fence is the WHERE clause: worker_id and lease_generation no longer
+-- match, so zero rows are affected and the write is silently discarded.
+UPDATE commitix_intents
+SET status           = 'SUCCESS',
+    worker_id        = NULL,
+    lease_until      = NULL,
+    version          = version + 1
+WHERE id = 1
+  AND worker_id      = 'worker-A'
+  AND lease_generation = 1;                  -- UPDATE 0  <- the whole point
+
+-- state still belongs to worker-B:
+SELECT status, worker_id, lease_generation FROM commitix_intents WHERE id = 1;
+--  RUNNING | worker-B | 2
+
+-- worker-B completes normally with its current token.
+UPDATE commitix_intents
+SET status           = 'SUCCESS',
+    worker_id        = NULL,
+    lease_until      = NULL,
+    version          = version + 1
+WHERE id = 1
+  AND worker_id      = 'worker-B'
+  AND lease_generation = 2;                  -- UPDATE 1
+```
+The `UPDATE 0` on the stale worker's write is the difference between this
+pattern and a bare `SELECT ... FOR UPDATE SKIP LOCKED` queue. Under the
+plain queue, worker-A's late write would clobber worker-B's state.
+
+Both halves of this walkthrough are proven in code:
+
+- **In-memory:** `go test -race ./internal/postgres/commitix/...`
+  (`TestStaleWorkerCannotCompleteAfterTakeover`,
+  `TestRecoveryPreservesLeaseGenerationAndAttemptCount`)
+- **Against live PostgreSQL:**
+  `go test -race -count=1 -tags=integration ./internal/postgres/integration/...`
+  (`TestCommitixStaleWorkerCompleteIsRejected`,
+  `TestCommitixRecoveryPreservesGenerationAndAttemptCount`)
+
+**What fencing does *not* protect:** external side effects. If worker-A
+already called a payment API before crashing, the fencing token stops
+worker-A from writing a database result, but it cannot undo the API call —
+worker-B will retry it. Commitix is at-least-once, so any operation whose
+duplicate execution is unacceptable needs its own idempotency or
+deduplication layer.
+
 ### Stop and clean up
 
 ```bash
@@ -161,7 +275,8 @@ This project follows the [golang-standards/project-layout](https://github.com/go
   Learning code lives here, grouped by module and topic.
 - `pkg/` — public packages intended for external reuse (kept minimal in a learning repo).
 - `docs/` — cheat sheet and glossary.
-- `testdata/` — SQL migrations for the postgres/outbox/inbox/idempotency examples.
+- `testdata/` — SQL migrations for the postgres/outbox/inbox/idempotency/commitix examples
+  (`001_init.sql`, `002_init.sql`).
 
 ## Contributing: how to add a new example
 
@@ -177,11 +292,14 @@ This project follows the [golang-standards/project-layout](https://github.com/go
 5. Run before pushing:
    `gofmt -l .`, `go vet ./...`, `go test -race ./...`
    (shortcuts: `make fmt vet test-race`; full list: `make help`).
-   Live-DB checks: `make db-up db-migrate test-integration`.`.
+   Live-DB checks: `make db-up db-migrate test-integration` — the
+   `db-migrate` target applies both `001_init.sql` and `002_init.sql`, and
+   the integration tests skip (not fail) when PostgreSQL is unreachable,
+   so tag-less CI stays green on machines without Docker.
 6. Never commit IDE-specific files (`.idea/`, `.vscode/`, `*.iml`) — they are
    already in `.gitignore`; keep them out of PRs.
 7. If your commit changes any runnable command (README snippet, Makefile target,
    migration step), the commit message must state the verification environment:
    OS, tool versions (`go version`, `docker --version`, image tag), and the
    observed result (exit code or key output lines). Verified documentation beats
-   documentation — and the claim must be re-checkable from the message alone.`.
+   documentation — and the claim must be re-checkable from the message alone.

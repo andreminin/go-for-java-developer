@@ -29,13 +29,16 @@ test-race: ## Unit tests with the race detector (mandatory for concurrency code)
 	go test -race ./...
 
 test-integration: ## Live-PostgreSQL tests (needs: make db-up db-migrate)
-	go test -tags=integration -race ./internal/postgres/integration/
+	go test -count=1 -tags=integration -race ./internal/postgres/integration/
 
 db-up: ## Start PostgreSQL 16 in Docker
 	docker compose up -d db
 
-db-migrate: ## Apply testdata/migrations/001_init.sql to the compose DB
-	docker compose exec -T db psql -U app -d app -v ON_ERROR_STOP=1 -f /testdata/migrations/001_init.sql
+db-migrate: ## Apply 001_init.sql and 002_init.sql (idempotent DDL)
+	docker compose exec -T db psql -U app -d app -v ON_ERROR_STOP=1 \
+	  -f /testdata/migrations/001_init.sql
+	docker compose exec -T db psql -U app -d app -v ON_ERROR_STOP=1 \
+	  -f /testdata/migrations/002_init.sql
 
 db-stop: ## Stop PostgreSQL, keep data in the pgdata volume
 	docker compose stop db
